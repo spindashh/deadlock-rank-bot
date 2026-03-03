@@ -567,9 +567,9 @@ async def rank_slash(interaction: discord.Interaction, user: Optional[discord.Me
     if os.path.exists(img_path):
         file = discord.File(img_path, filename=os.path.basename(img_path))
         embed.set_thumbnail(url=f"attachment://{os.path.basename(img_path)}")
-        await interaction.response.send_message(embed=embed, file=file, ephemeral=True)
+        await interaction.response.send_message(embed=embed, file=file)
     else:
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="leaderboard", description="Top 10")
 async def leaderboard_slash(interaction: discord.Interaction):
