@@ -13,18 +13,15 @@ from discord import app_commands
 # CONFIG
 # =========================
 
-# Railway (o cualquier host): pon DISCORD_TOKEN en variables de entorno
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise RuntimeError("Falta la variable de entorno DISCORD_TOKEN")
 
 DB_PATH = "data.db"
-
-# Prefijo NO-común
 DEFAULT_PREFIX = "dl!"
 
-# Canal fijo para rank-ups
-RANK_UP_CHANNEL_ID = 1477135861127839884  # #discord-rangos
+# Default rank-up channel (tu #discord-rangos)
+DEFAULT_RANK_UP_CHANNEL_ID = 1477135861127839884
 
 # XP settings
 MIN_CHARS_FOR_XP = 10
@@ -32,9 +29,9 @@ XP_PER_MESSAGE_MIN = 12
 XP_PER_MESSAGE_MAX = 20
 XP_COOLDOWN_SECONDS = 45
 
-# Ranks (Deadlock)
+# Ranks
 LEVELS_PER_RANK = 10
-MAX_RANK_INDEX = 10  # 0..10 = 11 rangos
+MAX_RANK_INDEX = 10  # 11 ranks (0..10)
 MAX_LEVEL_PER_PRESTIGE = (MAX_RANK_INDEX + 1) * LEVELS_PER_RANK  # 110
 
 RANKS = [
@@ -51,6 +48,21 @@ RANKS = [
     ("Eternus",   "ranks/11_eternus.png"),
 ]
 
+# Colores por rango (simple pero queda brutal)
+RANK_COLORS = [
+    0x5B5B5B,  # Initiate
+    0x3B6EA5,  # Seeker
+    0x2E8B57,  # Alchemist
+    0x6A5ACD,  # Arcanist
+    0x8B4513,  # Ritualist
+    0xB8860B,  # Emissary
+    0xC0C0C0,  # Archon
+    0x00CED1,  # Oracle
+    0xFF1493,  # Phantom
+    0xFF8C00,  # Ascendant
+    0xE6E6FA,  # Eternus
+]
+
 # =========================
 # HELPERS
 # =========================
@@ -59,6 +71,7 @@ def clamp(n: int, a: int, b: int) -> int:
     return max(a, min(b, n))
 
 def xp_required_for_next_level(level: int) -> int:
+    # curva suave (normal-lenta)
     return 100 + 35 * level + 5 * (level ** 2)
 
 def rank_index_from_level(level: int) -> int:
@@ -70,6 +83,9 @@ def rank_name_from_level(level: int) -> str:
 
 def rank_image_from_level(level: int) -> str:
     return RANKS[rank_index_from_level(level)][1]
+
+def color_from_level(level: int) -> int:
+    return RANK_COLORS[rank_index_from_level(level)]
 
 @dataclass
 class UserState:
@@ -88,6 +104,12 @@ def db_connect():
     conn.execute("PRAGMA journal_mode=WAL;")
     return conn
 
+def _try_alter(conn: sqlite3.Connection, sql: str):
+    try:
+        conn.execute(sql)
+    except sqlite3.OperationalError:
+        pass
+
 def db_init():
     with db_connect() as conn:
         conn.execute("""
@@ -102,9 +124,16 @@ def db_init():
         conn.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 guild_id        INTEGER PRIMARY KEY,
-                prefix          TEXT NOT NULL
+                prefix          TEXT NOT NULL DEFAULT 'dl!',
+                rankup_channel_id INTEGER,
+                announce_origin INTEGER NOT NULL DEFAULT 1,
+                announce_rankchannel INTEGER NOT NULL DEFAULT 1
             )
         """)
+        # Migraciones si tu DB vieja no tenía columnas
+        _try_alter(conn, "ALTER TABLE settings ADD COLUMN rankup_channel_id INTEGER")
+        _try_alter(conn, "ALTER TABLE settings ADD COLUMN announce_origin INTEGER NOT NULL DEFAULT 1")
+        _try_alter(conn, "ALTER TABLE settings ADD COLUMN announce_rankchannel INTEGER NOT NULL DEFAULT 1")
 
 def get_or_create_user(user_id: int) -> UserState:
     with db_connect() as conn:
@@ -128,7 +157,6 @@ def update_user(state: UserState):
         )
 
 def set_user_progress(user_id: int, prestige: int, level: int, xp: int = 0):
-    # asegura que exista
     st = get_or_create_user(user_id)
     st.prestige = max(0, int(prestige))
     st.level = clamp(int(level), 1, MAX_LEVEL_PER_PRESTIGE)
@@ -141,6 +169,9 @@ def add_user_xp(user_id: int, amount: int):
     st.xp += max(0, int(amount))
 
     leveled_up = False
+    old_level = st.level
+    old_prestige = st.prestige
+
     while True:
         need = xp_required_for_next_level(st.level)
         if st.xp >= need:
@@ -150,27 +181,13 @@ def add_user_xp(user_id: int, amount: int):
         else:
             break
 
-    # Prestige
     if st.level > MAX_LEVEL_PER_PRESTIGE:
         st.prestige += 1
         st.level = 1
         st.xp = 0
 
     update_user(st)
-    return st, leveled_up
-
-def get_guild_prefix(guild_id: int) -> str:
-    with db_connect() as conn:
-        row = conn.execute("SELECT prefix FROM settings WHERE guild_id=?", (guild_id,)).fetchone()
-        return row[0] if row else DEFAULT_PREFIX
-
-def set_guild_prefix(guild_id: int, prefix: str):
-    with db_connect() as conn:
-        conn.execute(
-            "INSERT INTO settings(guild_id, prefix) VALUES (?,?) "
-            "ON CONFLICT(guild_id) DO UPDATE SET prefix=excluded.prefix",
-            (guild_id, prefix)
-        )
+    return st, (st.level != old_level or st.prestige != old_prestige)
 
 def top_users(limit: int = 10) -> List[Tuple[int, int, int, int]]:
     with db_connect() as conn:
@@ -179,6 +196,63 @@ def top_users(limit: int = 10) -> List[Tuple[int, int, int, int]]:
             "ORDER BY prestige DESC, level DESC, xp DESC LIMIT ?",
             (limit,)
         ).fetchall()
+
+def _get_setting_row(guild_id: int):
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT prefix, rankup_channel_id, announce_origin, announce_rankchannel FROM settings WHERE guild_id=?",
+            (guild_id,)
+        ).fetchone()
+        if row:
+            return row
+        conn.execute(
+            "INSERT INTO settings(guild_id, prefix, rankup_channel_id, announce_origin, announce_rankchannel) VALUES (?,?,?,?,?)",
+            (guild_id, DEFAULT_PREFIX, DEFAULT_RANK_UP_CHANNEL_ID, 1, 1)
+        )
+        return (DEFAULT_PREFIX, DEFAULT_RANK_UP_CHANNEL_ID, 1, 1)
+
+def get_guild_prefix(guild_id: int) -> str:
+    return _get_setting_row(guild_id)[0]
+
+def set_guild_prefix(guild_id: int, prefix: str):
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT INTO settings(guild_id, prefix, rankup_channel_id, announce_origin, announce_rankchannel) "
+            "VALUES (?,?,?,?,?) "
+            "ON CONFLICT(guild_id) DO UPDATE SET prefix=excluded.prefix",
+            (guild_id, prefix, DEFAULT_RANK_UP_CHANNEL_ID, 1, 1)
+        )
+
+def get_rankup_channel_id(guild_id: int) -> int:
+    cid = _get_setting_row(guild_id)[1]
+    return int(cid) if cid else DEFAULT_RANK_UP_CHANNEL_ID
+
+def set_rankup_channel_id(guild_id: int, channel_id: int):
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT INTO settings(guild_id, prefix, rankup_channel_id, announce_origin, announce_rankchannel) "
+            "VALUES (?,?,?,?,?) "
+            "ON CONFLICT(guild_id) DO UPDATE SET rankup_channel_id=excluded.rankup_channel_id",
+            (guild_id, get_guild_prefix(guild_id), int(channel_id), 1, 1)
+        )
+
+def get_announce_flags(guild_id: int) -> Tuple[bool, bool]:
+    _, _, ao, arc = _get_setting_row(guild_id)
+    return (bool(ao), bool(arc))
+
+def set_announce_origin(guild_id: int, enabled: bool):
+    with db_connect() as conn:
+        conn.execute(
+            "UPDATE settings SET announce_origin=? WHERE guild_id=?",
+            (1 if enabled else 0, guild_id)
+        )
+
+def set_announce_rankchannel(guild_id: int, enabled: bool):
+    with db_connect() as conn:
+        conn.execute(
+            "UPDATE settings SET announce_rankchannel=? WHERE guild_id=?",
+            (1 if enabled else 0, guild_id)
+        )
 
 # =========================
 # DISCORD BOT SETUP
@@ -195,14 +269,12 @@ async def dynamic_prefix(bot: commands.Bot, message: discord.Message):
 
 bot = commands.Bot(command_prefix=dynamic_prefix, intents=intents, help_command=None)
 
-async def get_rankup_channel(guild: Optional[discord.Guild]) -> Optional[discord.abc.Messageable]:
-    # Primero intenta cache
-    ch = bot.get_channel(RANK_UP_CHANNEL_ID)
+async def fetch_channel_safe(channel_id: int) -> Optional[discord.abc.Messageable]:
+    ch = bot.get_channel(channel_id)
     if ch:
         return ch
-    # Si no está en cache, intenta fetch
     try:
-        return await bot.fetch_channel(RANK_UP_CHANNEL_ID)
+        return await bot.fetch_channel(channel_id)
     except Exception:
         return None
 
@@ -268,7 +340,7 @@ async def try_add_xp(message: discord.Message):
 
 async def announce_levelup(
     origin_channel: discord.abc.Messageable,
-    guild: Optional[discord.Guild],
+    guild: discord.Guild,
     member: discord.abc.User,
     old_level: int,
     new_level: int,
@@ -278,51 +350,58 @@ async def announce_levelup(
     prestiged: bool,
     old_prestige: int
 ):
+    # Flags
+    announce_origin, announce_rankchannel = get_announce_flags(guild.id)
+    rankup_channel_id = get_rankup_channel_id(guild.id)
+    rankup_channel = await fetch_channel_safe(rankup_channel_id)
+
+    # Mensajes especiales
+    reached_eternus = (rank_index_from_level(new_level) == MAX_RANK_INDEX and new_level == MAX_LEVEL_PER_PRESTIGE)
+
     if prestiged:
         title = "🜂 PRESTIGE UNLOCKED"
-        desc = f"{member.mention} trascendió el ciclo. **Prestige {old_prestige} → {prestige}**.\nReiniciando el rito…"
+        desc = (
+            f"{member.mention} rompió el ciclo. **Prestige {old_prestige} → {prestige}**\n"
+            "La rueda gira de nuevo…"
+        )
     else:
-        title = "⚡ RANK UP"
         if new_rank != old_rank:
+            title = "⚡ RANK ASCENSION"
             desc = f"{member.mention} ascendió: **{old_rank} → {new_rank}** (Lv {old_level} → {new_level})"
         else:
+            title = "⚡ LEVEL UP"
             desc = f"{member.mention} subió a **Lv {new_level}** (**{new_rank}**)"
 
-    embed = discord.Embed(title=title, description=desc, color=discord.Color.blurple())
+        if reached_eternus:
+            desc += "\n\n**👑 ETERNUS ACHIEVED** — el chat ya no puede contenerte."
+
+    embed = discord.Embed(title=title, description=desc, color=discord.Color(color_from_level(new_level)))
     embed.set_footer(text="Deadlock Chat Ranks • XP por actividad")
 
     img_path = rank_image_from_level(new_level)
-    file: Optional[discord.File] = None
-    if os.path.exists(img_path):
-        file = discord.File(img_path, filename=os.path.basename(img_path))
+    has_img = os.path.exists(img_path)
+    file1: Optional[discord.File] = None
+    if has_img:
+        file1 = discord.File(img_path, filename=os.path.basename(img_path))
         embed.set_thumbnail(url=f"attachment://{os.path.basename(img_path)}")
 
-    # destino extra
-    rankup_channel = await get_rankup_channel(guild)
-
-    # manda al canal original
-    try:
-        if file:
-            await origin_channel.send(embed=embed, file=file)
-        else:
-            await origin_channel.send(embed=embed)
-    except Exception:
-        pass
-
-    # manda también a #discord-rangos (si existe y no es el mismo canal)
-    try:
-        if rankup_channel and getattr(rankup_channel, "id", None) != getattr(origin_channel, "id", None):
-            if file:
-                # recrea el file (discord no reusa el mismo archivo bien a veces)
-                file2 = discord.File(img_path, filename=os.path.basename(img_path)) if os.path.exists(img_path) else None
-                if file2:
-                    await rankup_channel.send(embed=embed, file=file2)
-                else:
-                    await rankup_channel.send(embed=embed)
+    async def send_to(channel: discord.abc.Messageable):
+        try:
+            if has_img:
+                f = discord.File(img_path, filename=os.path.basename(img_path))
+                await channel.send(embed=embed, file=f)
             else:
-                await rankup_channel.send(embed=embed)
-    except Exception:
-        pass
+                await channel.send(embed=embed)
+        except Exception:
+            pass
+
+    # 1) canal donde subió
+    if announce_origin:
+        await send_to(origin_channel)
+
+    # 2) canal #discord-rangos (si es distinto)
+    if announce_rankchannel and rankup_channel and getattr(rankup_channel, "id", None) != getattr(origin_channel, "id", None):
+        await send_to(rankup_channel)
 
 # =========================
 # EVENTS
@@ -348,14 +427,23 @@ async def on_message(message: discord.Message):
 @bot.command(name="commands")
 async def commands_list(ctx: commands.Context):
     prefix = get_guild_prefix(ctx.guild.id) if ctx.guild else DEFAULT_PREFIX
+    ao, arc = get_announce_flags(ctx.guild.id) if ctx.guild else (True, True)
+    cid = get_rankup_channel_id(ctx.guild.id) if ctx.guild else DEFAULT_RANK_UP_CHANNEL_ID
+
     msg = (
         f"**Comandos ({prefix})**\n"
         f"- `{prefix}rank` → tu rango / nivel / xp\n"
         f"- `{prefix}top` → leaderboard\n"
         f"- `{prefix}setprefix <nuevo>` → cambia el prefijo (admin)\n"
         f"- `{prefix}givexp <cantidad> [@user]` → da XP (admin)\n"
-        f"- `{prefix}maxme` → ponerte rango máximo (admin)\n\n"
-        "También tienes slash commands: **/rank** **/leaderboard** **/givexp** **/maxme**"
+        f"- `{prefix}maxme` → ponerte Lv 110 (admin)\n"
+        f"- `{prefix}setrankchannel #canal` → set canal rank-ups (admin)\n"
+        f"- `{prefix}toggleorigin` → on/off rank-ups en canal donde sube (admin)\n"
+        f"- `{prefix}togglerankchannel` → on/off rank-ups en canal fijo (admin)\n\n"
+        f"**Ajustes**\n"
+        f"- Rank-up channel id: `{cid}`\n"
+        f"- announce_origin: `{ao}` | announce_rankchannel: `{arc}`\n\n"
+        "Slash: **/rank /leaderboard /givexp /maxme /setrankchannel /toggleorigin /togglerankchannel**"
     )
     await ctx.reply(msg, mention_author=False)
 
@@ -365,11 +453,20 @@ async def rank_text(ctx: commands.Context, member: Optional[discord.Member] = No
     st = get_or_create_user(member.id)
     rank = rank_name_from_level(st.level)
     need = xp_required_for_next_level(st.level)
-    await ctx.reply(
-        f"**{member.display_name}** • Prestige **{st.prestige}** • **{rank}**\n"
-        f"Lv **{st.level}** • XP **{st.xp}/{need}**",
-        mention_author=False
+
+    embed = discord.Embed(
+        title=f"{member.display_name} • {rank}",
+        description=f"Prestige **{st.prestige}**\nLv **{st.level}** • XP **{st.xp}/{need}**",
+        color=discord.Color(color_from_level(st.level))
     )
+
+    img_path = rank_image_from_level(st.level)
+    if os.path.exists(img_path):
+        file = discord.File(img_path, filename=os.path.basename(img_path))
+        embed.set_thumbnail(url=f"attachment://{os.path.basename(img_path)}")
+        await ctx.reply(embed=embed, file=file, mention_author=False)
+    else:
+        await ctx.reply(embed=embed, mention_author=False)
 
 @bot.command(name="top")
 async def top_text(ctx: commands.Context):
@@ -378,8 +475,7 @@ async def top_text(ctx: commands.Context):
     for i, (uid, p, lvl, xp) in enumerate(rows, start=1):
         user = ctx.guild.get_member(uid) if ctx.guild else None
         name = user.display_name if user else f"<@{uid}>"
-        rname = rank_name_from_level(lvl)
-        lines.append(f"**{i}.** {name} — P{p} • Lv{lvl} • {rname}")
+        lines.append(f"**{i}.** {name} — P{p} • Lv{lvl} • {rank_name_from_level(lvl)}")
     await ctx.reply("🏆 **Leaderboard**\n" + "\n".join(lines), mention_author=False)
 
 @bot.command(name="setprefix")
@@ -391,64 +487,64 @@ async def setprefix_cmd(ctx: commands.Context, new_prefix: str):
     set_guild_prefix(ctx.guild.id, new_prefix)
     await ctx.reply(f"Listo. Nuevo prefijo: `{new_prefix}`", mention_author=False)
 
-@setprefix_cmd.error
-async def setprefix_error(ctx: commands.Context, error):
-    if isinstance(error, commands.MissingPermissions):
-        await ctx.reply("Necesitas **Manage Server** para cambiar el prefijo.", mention_author=False)
-
 @bot.command(name="givexp")
 @commands.has_permissions(manage_guild=True)
 async def givexp_cmd(ctx: commands.Context, amount: int, member: Optional[discord.Member] = None):
     member = member or ctx.author
-    st_before = get_or_create_user(member.id)
-    old_level = st_before.level
-    old_rank = rank_name_from_level(st_before.level)
-    old_prestige = st_before.prestige
 
-    st_after, leveled = add_user_xp(member.id, amount)
+    before = get_or_create_user(member.id)
+    old_level, old_rank, old_prestige = before.level, rank_name_from_level(before.level), before.prestige
+
+    after, changed = add_user_xp(member.id, amount)
 
     await ctx.reply(
         f"✅ XP dado a **{member.display_name}**: +{amount}\n"
-        f"Ahora: P{st_after.prestige} • Lv {st_after.level} • XP {st_after.xp}/{xp_required_for_next_level(st_after.level)}",
+        f"Ahora: P{after.prestige} • Lv {after.level} • XP {after.xp}/{xp_required_for_next_level(after.level)}",
         mention_author=False
     )
 
-    # Si subió de nivel por el give, anunciar también
-    if (st_after.level != old_level) or (st_after.prestige != old_prestige):
+    if changed:
         await announce_levelup(
             origin_channel=ctx.channel,
             guild=ctx.guild,
             member=member,
             old_level=old_level,
-            new_level=st_after.level,
+            new_level=after.level,
             old_rank=old_rank,
-            new_rank=rank_name_from_level(st_after.level),
-            prestige=st_after.prestige,
-            prestiged=(st_after.prestige != old_prestige),
+            new_rank=rank_name_from_level(after.level),
+            prestige=after.prestige,
+            prestiged=(after.prestige != old_prestige),
             old_prestige=old_prestige
         )
-
-@givexp_cmd.error
-async def givexp_error(ctx: commands.Context, error):
-    if isinstance(error, commands.MissingPermissions):
-        await ctx.reply("Necesitas **Manage Server** para usar esto.", mention_author=False)
-    else:
-        await ctx.reply("Uso: `dl!givexp <cantidad> [@user]`", mention_author=False)
 
 @bot.command(name="maxme")
 @commands.has_permissions(manage_guild=True)
 async def maxme_cmd(ctx: commands.Context):
-    # “rango maximo” dentro del sistema: Eternus = Lv 110
     set_user_progress(ctx.author.id, prestige=0, level=MAX_LEVEL_PER_PRESTIGE, xp=0)
     await ctx.reply(
-        f"✅ Listo: **{ctx.author.display_name}** ahora es **{rank_name_from_level(MAX_LEVEL_PER_PRESTIGE)}** (Lv {MAX_LEVEL_PER_PRESTIGE}).",
+        f"✅ Listo: ahora eres **{rank_name_from_level(MAX_LEVEL_PER_PRESTIGE)}** (Lv {MAX_LEVEL_PER_PRESTIGE}).",
         mention_author=False
     )
 
-@maxme_cmd.error
-async def maxme_error(ctx: commands.Context, error):
-    if isinstance(error, commands.MissingPermissions):
-        await ctx.reply("Necesitas **Manage Server** para usar esto.", mention_author=False)
+@bot.command(name="setrankchannel")
+@commands.has_permissions(manage_guild=True)
+async def setrankchannel_cmd(ctx: commands.Context, channel: discord.TextChannel):
+    set_rankup_channel_id(ctx.guild.id, channel.id)
+    await ctx.reply(f"✅ Rank-ups ahora también van a: {channel.mention}", mention_author=False)
+
+@bot.command(name="toggleorigin")
+@commands.has_permissions(manage_guild=True)
+async def toggleorigin_cmd(ctx: commands.Context):
+    ao, arc = get_announce_flags(ctx.guild.id)
+    set_announce_origin(ctx.guild.id, not ao)
+    await ctx.reply(f"✅ announce_origin = `{not ao}`", mention_author=False)
+
+@bot.command(name="togglerankchannel")
+@commands.has_permissions(manage_guild=True)
+async def togglerankchannel_cmd(ctx: commands.Context):
+    ao, arc = get_announce_flags(ctx.guild.id)
+    set_announce_rankchannel(ctx.guild.id, not arc)
+    await ctx.reply(f"✅ announce_rankchannel = `{not arc}`", mention_author=False)
 
 # =========================
 # SLASH COMMANDS
@@ -464,8 +560,9 @@ async def rank_slash(interaction: discord.Interaction, user: Optional[discord.Me
     embed = discord.Embed(
         title=f"{user.display_name} • {rank}",
         description=f"Prestige **{st.prestige}**\nLv **{st.level}** • XP **{st.xp}/{need}**",
-        color=discord.Color.blurple()
+        color=discord.Color(color_from_level(st.level))
     )
+
     img_path = rank_image_from_level(st.level)
     if os.path.exists(img_path):
         file = discord.File(img_path, filename=os.path.basename(img_path))
@@ -474,7 +571,7 @@ async def rank_slash(interaction: discord.Interaction, user: Optional[discord.Me
     else:
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="leaderboard", description="Top 10 global del bot")
+@bot.tree.command(name="leaderboard", description="Top 10")
 async def leaderboard_slash(interaction: discord.Interaction):
     rows = top_users(10)
     lines = []
@@ -483,47 +580,32 @@ async def leaderboard_slash(interaction: discord.Interaction):
     embed = discord.Embed(title="🏆 Leaderboard", description="\n".join(lines), color=discord.Color.blurple())
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="setprefix", description="Cambia el prefijo de comandos de texto (admin)")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def setprefix_slash(interaction: discord.Interaction, new_prefix: str):
-    if len(new_prefix) > 8:
-        await interaction.response.send_message("Muy largo. Usa algo corto (ej: `dl!` `dl.` `d!`).", ephemeral=True)
-        return
-    if not interaction.guild:
-        await interaction.response.send_message("Solo en servidor.", ephemeral=True)
-        return
-    set_guild_prefix(interaction.guild.id, new_prefix)
-    await interaction.response.send_message(f"Listo. Nuevo prefijo: `{new_prefix}`", ephemeral=True)
-
 @bot.tree.command(name="givexp", description="Da XP (admin)")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def givexp_slash(interaction: discord.Interaction, amount: int, user: Optional[discord.Member] = None):
     user = user or interaction.user
 
-    st_before = get_or_create_user(user.id)
-    old_level = st_before.level
-    old_rank = rank_name_from_level(st_before.level)
-    old_prestige = st_before.prestige
+    before = get_or_create_user(user.id)
+    old_level, old_rank, old_prestige = before.level, rank_name_from_level(before.level), before.prestige
 
-    st_after, _ = add_user_xp(user.id, amount)
-
+    after, changed = add_user_xp(user.id, amount)
     await interaction.response.send_message(
         f"✅ XP dado a **{user.display_name}**: +{amount}\n"
-        f"Ahora: P{st_after.prestige} • Lv {st_after.level} • XP {st_after.xp}/{xp_required_for_next_level(st_after.level)}",
+        f"Ahora: P{after.prestige} • Lv {after.level} • XP {after.xp}/{xp_required_for_next_level(after.level)}",
         ephemeral=True
     )
 
-    if interaction.channel and (st_after.level != old_level or st_after.prestige != old_prestige):
+    if changed and interaction.channel and interaction.guild:
         await announce_levelup(
             origin_channel=interaction.channel,
             guild=interaction.guild,
             member=user,
             old_level=old_level,
-            new_level=st_after.level,
+            new_level=after.level,
             old_rank=old_rank,
-            new_rank=rank_name_from_level(st_after.level),
-            prestige=st_after.prestige,
-            prestiged=(st_after.prestige != old_prestige),
+            new_rank=rank_name_from_level(after.level),
+            prestige=after.prestige,
+            prestiged=(after.prestige != old_prestige),
             old_prestige=old_prestige
         )
 
@@ -535,6 +617,35 @@ async def maxme_slash(interaction: discord.Interaction):
         f"✅ Listo: ahora eres **{rank_name_from_level(MAX_LEVEL_PER_PRESTIGE)}** (Lv {MAX_LEVEL_PER_PRESTIGE}).",
         ephemeral=True
     )
+
+@bot.tree.command(name="setrankchannel", description="Set canal de rank-ups (admin)")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def setrankchannel_slash(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not interaction.guild:
+        await interaction.response.send_message("Solo en servidor.", ephemeral=True)
+        return
+    set_rankup_channel_id(interaction.guild.id, channel.id)
+    await interaction.response.send_message(f"✅ Rank-ups ahora también van a: {channel.mention}", ephemeral=True)
+
+@bot.tree.command(name="toggleorigin", description="On/Off rank-ups en el canal donde sube (admin)")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def toggleorigin_slash(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("Solo en servidor.", ephemeral=True)
+        return
+    ao, arc = get_announce_flags(interaction.guild.id)
+    set_announce_origin(interaction.guild.id, not ao)
+    await interaction.response.send_message(f"✅ announce_origin = `{not ao}`", ephemeral=True)
+
+@bot.tree.command(name="togglerankchannel", description="On/Off rank-ups en el canal fijo (admin)")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def togglerankchannel_slash(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("Solo en servidor.", ephemeral=True)
+        return
+    ao, arc = get_announce_flags(interaction.guild.id)
+    set_announce_rankchannel(interaction.guild.id, not arc)
+    await interaction.response.send_message(f"✅ announce_rankchannel = `{not arc}`", ephemeral=True)
 
 # =========================
 # MAIN
