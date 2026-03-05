@@ -424,18 +424,21 @@ async def leaderboard_slash(interaction: discord.Interaction):
 def has_owner_role(member: discord.Member) -> bool:
     return any(r.name == OWNER_ROLE_NAME for r in member.roles)
 
-@bot.tree.command(name="maxme", description="(Owner) Te pone en el nivel máximo")
+# ✅ NUEVO: admin check
+def is_admin(member: discord.Member) -> bool:
+    return member.guild_permissions.administrator
+
+@bot.tree.command(name="maxme", description="(Admin) Te pone en el nivel máximo")
 async def maxme_slash(interaction: discord.Interaction):
     if not isinstance(interaction.user, discord.Member):
-        await interaction.response.send_message("No pude validar tu rol.", ephemeral=True)
+        await interaction.response.send_message("No pude validar tus permisos.", ephemeral=True)
         return
 
-    if not has_owner_role(interaction.user):
-        await interaction.response.send_message("⛔ Solo el **Owner** puede usar este comando.", ephemeral=True)
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("⛔ Solo **admins** pueden usar este comando.", ephemeral=True)
         return
 
     # set max level
-    st = get_or_create_user(interaction.user.id)
     update_user(interaction.user.id, level=MAX_LEVEL, xp=0)
 
     title = rank_name_from_level(MAX_LEVEL)
