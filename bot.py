@@ -25,9 +25,6 @@ BACKUP_EVERY_SECONDS = int(os.getenv("BACKUP_EVERY_SECONDS", "300"))     # 5 min
 # Rankups channel
 RANKUP_CHANNEL_ID = int(os.getenv("RANKUP_CHANNEL_ID", "0"))
 
-# Owner role name (solo este rol puede usar /maxme)
-OWNER_ROLE_NAME = os.getenv("OWNER_ROLE_NAME", "Owner")
-
 # DB file
 DB_PATH = os.getenv("DB_PATH", "data.db")
 
@@ -44,8 +41,8 @@ VOICE_XP_PER_TICK = int(os.getenv("VOICE_XP_PER_TICK", "12"))
 XP_BASE = int(os.getenv("XP_BASE", "250"))
 XP_STEP = int(os.getenv("XP_STEP", "60"))
 
-# Max level (para /maxme)
-MAX_LEVEL = int(os.getenv("MAX_LEVEL", "30"))
+# ✅ Max level real (Eternus)
+MAX_LEVEL = int(os.getenv("MAX_LEVEL", "110"))
 
 # =========================
 # DISCORD SETUP
@@ -95,7 +92,14 @@ def get_or_create_user(user_id: int) -> sqlite3.Row:
         cur = con.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
         return cur.fetchone()
 
-def update_user(user_id: int, *, xp: Optional[int] = None, level: Optional[int] = None, prestige: Optional[int] = None, last_msg_ts: Optional[float] = None):
+def update_user(
+    user_id: int,
+    *,
+    xp: Optional[int] = None,
+    level: Optional[int] = None,
+    prestige: Optional[int] = None,
+    last_msg_ts: Optional[float] = None
+):
     fields = []
     values = []
     if xp is not None:
@@ -130,16 +134,18 @@ def top_users(limit: int = 10) -> List[sqlite3.Row]:
 # RANK LOGIC
 # =========================
 
+# ✅ Cada ~10 niveles, Eternus en 110
 RANK_TITLES = [
-    (1,  "Initiate"),
-    (3,  "Seeker"),
-    (5,  "Alchemist"),
-    (8,  "Arcanist"),
-    (11, "Ritualist"),
-    (15, "Emissary"),
-    (20, "Archon"),
-    (25, "Oracle"),
-    (30, "Phantom"),
+    (1,   "Initiate"),
+    (10,  "Seeker"),
+    (20,  "Alchemist"),
+    (30,  "Arcanist"),
+    (40,  "Ritualist"),
+    (50,  "Emissary"),
+    (60,  "Archon"),
+    (80,  "Oracle"),
+    (100, "Phantom"),
+    (110, "Eternus"),
 ]
 
 def rank_name_from_level(level: int) -> str:
@@ -153,17 +159,17 @@ def xp_required_for_next_level(level: int) -> int:
     return XP_BASE + (level * XP_STEP)
 
 def rank_image_from_level(level: int) -> str:
-    # Asume que tienes ranks/01_initiate.png ... etc
-    # Ajusta según tu carpeta ranks
-    # Mapeo simple por thresholds
-    if level >= 30: return "ranks/09_phantom.png"
-    if level >= 25: return "ranks/08_oracle.png"
-    if level >= 20: return "ranks/07_archon.png"
-    if level >= 15: return "ranks/06_emissary.png"
-    if level >= 11: return "ranks/05_ritualist.png"
-    if level >= 8:  return "ranks/04_arcanist.png"
-    if level >= 5:  return "ranks/03_alchemist.png"
-    if level >= 3:  return "ranks/02_seeker.png"
+    # ✅ tus archivos: ranks/01...11 (incluye 11_eternus.png)
+    if level >= 110: return "ranks/11_eternus.png"
+    if level >= 100: return "ranks/10_ascendant.png"
+    if level >= 80:  return "ranks/09_phantom.png"
+    if level >= 60:  return "ranks/08_oracle.png"
+    if level >= 50:  return "ranks/07_archon.png"
+    if level >= 40:  return "ranks/06_emissary.png"
+    if level >= 30:  return "ranks/05_ritualist.png"
+    if level >= 20:  return "ranks/04_arcanist.png"
+    if level >= 10:  return "ranks/03_alchemist.png"
+    if level >= 5:   return "ranks/02_seeker.png"
     return "ranks/01_initiate.png"
 
 async def announce_rankup(member: discord.Member, new_level: int, prestige: int):
@@ -188,7 +194,6 @@ def apply_xp_and_levelup(user_id: int, add_xp: int) -> Tuple[int, int, int, bool
     prestige = int(st["prestige"])
     leveled_up = False
 
-    # Level up loop
     while level < MAX_LEVEL:
         need = xp_required_for_next_level(level)
         if xp >= need:
@@ -212,14 +217,10 @@ def github_headers():
     }
 
 async def github_download_db_if_exists() -> bool:
-    """
-    Download backup/data.db from GitHub if it exists, write to DB_PATH.
-    Returns True if downloaded, False if not found or not configured.
-    """
     if not (GITHUB_TOKEN and GITHUB_REPO and GITHUB_BACKUP_PATH):
         return False
 
-    import requests  # needs in requirements.txt
+    import requests
 
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_BACKUP_PATH}"
     try:
@@ -242,14 +243,10 @@ async def github_download_db_if_exists() -> bool:
         return False
 
 async def github_upload_db() -> bool:
-    """
-    Upload local DB_PATH to GitHub at GITHUB_BACKUP_PATH.
-    Returns True on success.
-    """
     if not (GITHUB_TOKEN and GITHUB_REPO and GITHUB_BACKUP_PATH):
         return False
 
-    import requests  # needs in requirements.txt
+    import requests
 
     if not os.path.exists(DB_PATH):
         return False
@@ -257,7 +254,6 @@ async def github_upload_db() -> bool:
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_BACKUP_PATH}"
 
     try:
-        # Need sha if file exists
         sha = None
         get_r = requests.get(url, headers=github_headers(), timeout=20)
         if get_r.status_code == 200:
@@ -294,7 +290,6 @@ async def backup_loop():
 @bot.event
 async def on_ready():
     db_init()
-    # restore primero, luego init (por si DB no existía local)
     await github_download_db_if_exists()
     db_init()
 
@@ -323,12 +318,10 @@ async def on_message(message: discord.Message):
     st = get_or_create_user(user_id)
     now = time.time()
 
-    # cooldown
     last_ts = float(st["last_msg_ts"])
     if (now - last_ts) < MSG_COOLDOWN_SECONDS:
         return
 
-    # award XP
     import random
     add = random.randint(MSG_XP_MIN, MSG_XP_MAX)
     update_user(user_id, last_msg_ts=now)
@@ -345,12 +338,8 @@ async def on_message(message: discord.Message):
 def eligible_voice_member(m: discord.Member) -> bool:
     if m.bot:
         return False
-    if not m.voice:
+    if not m.voice or not m.voice.channel:
         return False
-    # Debe estar en un canal
-    if not m.voice.channel:
-        return False
-    # Si está AFK o self-deafened, opcional: puedes bloquearlo
     if m.voice.self_deaf or m.voice.deaf:
         return False
     return True
@@ -358,12 +347,10 @@ def eligible_voice_member(m: discord.Member) -> bool:
 @tasks.loop(seconds=VOICE_XP_EVERY_SECONDS)
 async def voice_xp_loop():
     for guild in bot.guilds:
-        # Recorre miembros en voice en esta guild
         for vc in guild.voice_channels:
             for member in vc.members:
                 if not eligible_voice_member(member):
                     continue
-
                 st = get_or_create_user(member.id)
                 old_level = int(st["level"])
                 xp, level, prestige, leveled_up = apply_xp_and_levelup(member.id, VOICE_XP_PER_TICK)
@@ -401,7 +388,6 @@ async def rank_slash(interaction: discord.Interaction, user: Optional[discord.Me
     if os.path.exists(img_path):
         file = discord.File(img_path, filename=os.path.basename(img_path))
         embed.set_thumbnail(url=f"attachment://{os.path.basename(img_path)}")
-        # 👇 IMPORTANTE: ephemeral=False para que TODOS lo vean
         await interaction.response.send_message(embed=embed, file=file, ephemeral=False)
     else:
         await interaction.response.send_message(embed=embed, ephemeral=False)
@@ -418,36 +404,35 @@ async def leaderboard_slash(interaction: discord.Interaction):
         title = rank_name_from_level(lvl)
         lines.append(f"{i}. {name} — P{prestige} • Lv{lvl} • {title}")
 
-    embed = discord.Embed(title="🏆 Leaderboard", description="\n".join(lines) if lines else "No hay datos aún.", color=discord.Color.gold())
+    embed = discord.Embed(
+        title="🏆 Leaderboard",
+        description="\n".join(lines) if lines else "No hay datos aún.",
+        color=discord.Color.gold()
+    )
     await interaction.response.send_message(embed=embed, ephemeral=False)
 
-def has_owner_role(member: discord.Member) -> bool:
-    return any(r.name == OWNER_ROLE_NAME for r in member.roles)
-
-# ✅ NUEVO: admin check
 def is_admin(member: discord.Member) -> bool:
+    # ✅ Solo admins (permiso administrador)
     return member.guild_permissions.administrator
 
 @bot.tree.command(name="maxme", description="(Admin) Te pone en el nivel máximo")
 async def maxme_slash(interaction: discord.Interaction):
     if not isinstance(interaction.user, discord.Member):
-        await interaction.response.send_message("No pude validar tus permisos.", ephemeral=True)
+        await interaction.response.send_message("No pude validar tu usuario.", ephemeral=True)
         return
 
     if not is_admin(interaction.user):
-        await interaction.response.send_message("⛔ Solo **admins** pueden usar este comando.", ephemeral=True)
+        await interaction.response.send_message("⛔ Solo **Admins** pueden usar este comando.", ephemeral=True)
         return
 
-    # set max level
     update_user(interaction.user.id, level=MAX_LEVEL, xp=0)
-
     title = rank_name_from_level(MAX_LEVEL)
     await interaction.response.send_message(f"👑 Listo. Ahora eres **Lv {MAX_LEVEL}** ({title}).", ephemeral=True)
 
-@bot.tree.command(name="backupnow", description="(Owner) Fuerza un backup ahora mismo")
+@bot.tree.command(name="backupnow", description="(Admin) Fuerza un backup ahora mismo")
 async def backupnow_slash(interaction: discord.Interaction):
-    if not isinstance(interaction.user, discord.Member) or not has_owner_role(interaction.user):
-        await interaction.response.send_message("⛔ Solo el **Owner** puede usar esto.", ephemeral=True)
+    if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
+        await interaction.response.send_message("⛔ Solo **Admins** pueden usar esto.", ephemeral=True)
         return
 
     ok = await github_upload_db()
