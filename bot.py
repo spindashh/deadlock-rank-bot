@@ -6,39 +6,39 @@ from dataclasses import dataclass
 from typing import Optional, List, Tuple
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 
 # =========================
 # CONFIG
 # =========================
 
-# En Railway/Render/etc crea una variable de entorno:
-# DISCORD_TOKEN = tu_token
+# Railway / Deploy: usa variable de entorno
 TOKEN = os.getenv("DISCORD_TOKEN")
-if not TOKEN:
+if not TOKEN or TOKEN.strip() == "":
     raise RuntimeError("Falta la variable de entorno DISCORD_TOKEN")
 
 DB_PATH = "data.db"
 
-# Canal donde SIEMPRE se anuncian los rank-ups (tu canal discord-rangos)
-RANKUP_CHANNEL_ID = 1477135861127839884
-
 # Prefijo NO-común para evitar choques con otros bots
 DEFAULT_PREFIX = "dl!"
+
+# Canal fijo para anunciar rank ups (tu canal discord-rangos)
+LEVELUP_CHANNEL_ID = 1477135861127839884
 
 # XP por mensajes
 MIN_CHARS_FOR_XP = 10
 XP_PER_MESSAGE_MIN = 12
 XP_PER_MESSAGE_MAX = 20
-XP_COOLDOWN_SECONDS = 45
+XP_COOLDOWN_SECONDS = 45  # 1 tick cada 45s por usuario
 
-# XP por voz
+# VOICE XP
 VOICE_XP_ENABLED = True
-VOICE_XP_PER_MIN = 5
-VOICE_MIN_SECONDS = 60
-VOICE_REQUIRE_2_USERS = True
-VOICE_IGNORE_MUTED = True
+VOICE_TICK_SECONDS = 180          # ✅ cada 3 minutos
+VOICE_XP_MIN = 10
+VOICE_XP_MAX = 16
+VOICE_REQUIRE_2_HUMANS = True     # evita farm solo
+VOICE_BLOCK_DEAF = True           # si está deaf/self_deaf no cuenta
 
 # Ranks (Deadlock)
 LEVELS_PER_RANK = 10
@@ -67,7 +67,7 @@ def clamp(n: int, a: int, b: int) -> int:
     return max(a, min(b, n))
 
 def xp_required_for_next_level(level: int) -> int:
-    # curva suave
+    # curva estable
     return 100 + 35 * level + 5 * (level ** 2)
 
 def rank_index_from_level(level: int) -> int:
@@ -86,7 +86,7 @@ class UserState:
     xp: int
     level: int
     prestige: int
-    last_xp_ts: int
+    last_xp_ts: int  # cooldown mensajes
 
 # =========================
 # DATABASE
@@ -112,6 +112,15 @@ def db_init():
             CREATE TABLE IF NOT EXISTS settings (
                 guild_id        INTEGER PRIMARY KEY,
                 prefix          TEXT NOT NULL
+            )
+        """)
+        # Voice tick tracking (NO toca users)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS voice (
+                user_id        INTEGER PRIMARY KEY,
+                guild_id       INTEGER NOT NULL DEFAULT 0,
+                channel_id     INTEGER NOT NULL DEFAULT 0,
+                last_tick_ts   INTEGER NOT NULL DEFAULT 0
             )
         """)
 
@@ -158,6 +167,27 @@ def top_users(limit: int = 10) -> List[Tuple[int, int, int, int]]:
         ).fetchall()
         return rows
 
+# ---- Voice DB helpers ----
+
+def voice_upsert(user_id: int, guild_id: int, channel_id: int, last_tick_ts: int):
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT INTO voice(user_id, guild_id, channel_id, last_tick_ts) VALUES (?,?,?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET guild_id=excluded.guild_id, channel_id=excluded.channel_id, last_tick_ts=excluded.last_tick_ts",
+            (user_id, guild_id, channel_id, last_tick_ts)
+        )
+
+def voice_delete(user_id: int):
+    with db_connect() as conn:
+        conn.execute("DELETE FROM voice WHERE user_id=?", (user_id,))
+
+def voice_get(user_id: int) -> Optional[Tuple[int, int, int, int]]:
+    with db_connect() as conn:
+        return conn.execute(
+            "SELECT user_id, guild_id, channel_id, last_tick_ts FROM voice WHERE user_id=?",
+            (user_id,)
+        ).fetchone()
+
 # =========================
 # DISCORD BOT SETUP
 # =========================
@@ -165,7 +195,6 @@ def top_users(limit: int = 10) -> List[Tuple[int, int, int, int]]:
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
-intents.members = True
 intents.voice_states = True
 
 async def dynamic_prefix(bot: commands.Bot, message: discord.Message):
@@ -175,28 +204,16 @@ async def dynamic_prefix(bot: commands.Bot, message: discord.Message):
 
 bot = commands.Bot(command_prefix=dynamic_prefix, intents=intents, help_command=None)
 
-# sesiones de voz
-voice_sessions = {}  # user_id -> (guild_id, channel_id, join_ts)
+def get_levelup_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
+    ch = guild.get_channel(LEVELUP_CHANNEL_ID)
+    return ch if isinstance(ch, discord.TextChannel) else None
 
 # =========================
-# ANNOUNCE / TARGET CHANNEL
+# RANKUP ANNOUNCE
 # =========================
-
-def get_rankup_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
-    ch = guild.get_channel(RANKUP_CHANNEL_ID)
-    if isinstance(ch, discord.TextChannel):
-        return ch
-    try:
-        fetched = bot.get_channel(RANKUP_CHANNEL_ID)
-        if isinstance(fetched, discord.TextChannel):
-            return fetched
-    except Exception:
-        pass
-    return None
 
 async def announce_levelup(
     guild: discord.Guild,
-    fallback_channel: discord.abc.Messageable,
     member: discord.abc.User,
     old_level: int,
     new_level: int,
@@ -206,7 +223,9 @@ async def announce_levelup(
     prestiged: bool,
     old_prestige: int
 ):
-    channel = get_rankup_channel(guild) or fallback_channel
+    ch = get_levelup_channel(guild)
+    if not ch:
+        return
 
     if prestiged:
         title = "🜂 PRESTIGE UNLOCKED"
@@ -222,22 +241,52 @@ async def announce_levelup(
     embed.set_footer(text="Deadlock Chat Ranks • XP por actividad")
 
     img_path = rank_image_from_level(new_level)
-    file: Optional[discord.File] = None
     if os.path.exists(img_path):
         file = discord.File(img_path, filename=os.path.basename(img_path))
         embed.set_thumbnail(url=f"attachment://{os.path.basename(img_path)}")
+        try:
+            await ch.send(embed=embed, file=file)
+        except Exception:
+            pass
+    else:
+        try:
+            await ch.send(embed=embed)
+        except Exception:
+            pass
 
-    try:
-        if file:
-            await channel.send(embed=embed, file=file)
+# =========================
+# XP CORE
+# =========================
+
+def apply_xp_and_levels(state: UserState, gained_xp: int) -> Tuple[bool, bool, int, str, int]:
+    """
+    returns:
+      leveled_up, prestiged, old_level, old_rank, old_prestige
+    """
+    old_level = state.level
+    old_rank = rank_name_from_level(state.level)
+    old_prestige = state.prestige
+
+    state.xp += gained_xp
+
+    leveled_up = False
+    while True:
+        need = xp_required_for_next_level(state.level)
+        if state.xp >= need:
+            state.xp -= need
+            state.level += 1
+            leveled_up = True
         else:
-            await channel.send(embed=embed)
-    except Exception:
-        pass
+            break
 
-# =========================
-# XP LOGIC (MESSAGES)
-# =========================
+    prestiged = False
+    if state.level > MAX_LEVEL_PER_PRESTIGE:
+        state.prestige += 1
+        state.level = 1
+        state.xp = 0
+        prestiged = True
+
+    return leveled_up, prestiged, old_level, old_rank, old_prestige
 
 async def try_add_xp_from_message(message: discord.Message):
     if message.author.bot or not message.guild:
@@ -247,134 +296,129 @@ async def try_add_xp_from_message(message: discord.Message):
     if len(content) < MIN_CHARS_FOR_XP:
         return
 
-    st = get_or_create_user(message.author.id)
+    state = get_or_create_user(message.author.id)
     now = int(time.time())
 
-    if now - st.last_xp_ts < XP_COOLDOWN_SECONDS:
+    if now - state.last_xp_ts < XP_COOLDOWN_SECONDS:
         return
 
     gained = random.randint(XP_PER_MESSAGE_MIN, XP_PER_MESSAGE_MAX)
-    st.last_xp_ts = now
-    st.xp += gained
+    state.last_xp_ts = now
 
-    leveled_up = False
-    old_level = st.level
-    old_rank = rank_name_from_level(st.level)
-    old_prestige = st.prestige
-
-    # level loop
-    while True:
-        need = xp_required_for_next_level(st.level)
-        if st.xp >= need:
-            st.xp -= need
-            st.level += 1
-            leveled_up = True
-        else:
-            break
-
-    # prestige
-    prestiged = False
-    if st.level > MAX_LEVEL_PER_PRESTIGE:
-        st.prestige += 1
-        st.level = 1
-        st.xp = 0
-        prestiged = True
-
-    update_user(st)
+    leveled_up, prestiged, old_level, old_rank, old_prestige = apply_xp_and_levels(state, gained)
+    update_user(state)
 
     if leveled_up or prestiged:
+        new_rank = rank_name_from_level(state.level)
         await announce_levelup(
             guild=message.guild,
-            fallback_channel=message.channel,
             member=message.author,
             old_level=old_level,
-            new_level=st.level,
+            new_level=state.level,
             old_rank=old_rank,
-            new_rank=rank_name_from_level(st.level),
-            prestige=st.prestige,
+            new_rank=new_rank,
+            prestige=state.prestige,
             prestiged=prestiged,
             old_prestige=old_prestige
         )
 
 # =========================
-# XP LOGIC (VOICE)
+# VOICE XP
 # =========================
 
-def voice_valid_for_xp(vs: discord.VoiceState) -> bool:
+def humans_in_voice(channel: discord.VoiceChannel) -> int:
+    return sum(1 for m in channel.members if not m.bot)
+
+def eligible_voice_member(m: discord.Member) -> bool:
+    if m.bot:
+        return False
+    vs = m.voice
     if not vs or not vs.channel:
         return False
-    if VOICE_IGNORE_MUTED and (vs.self_mute or vs.self_deaf or vs.mute or vs.deaf):
+    if VOICE_BLOCK_DEAF and (vs.self_deaf or vs.deaf):
         return False
-    if VOICE_REQUIRE_2_USERS:
-        humans = [m for m in vs.channel.members if not m.bot]
-        if len(humans) < 2:
-            return False
     return True
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-    if not VOICE_XP_ENABLED or member.bot or not member.guild:
+    if not VOICE_XP_ENABLED:
+        return
+    if member.bot or not member.guild:
         return
 
     now = int(time.time())
 
-    # cerrar sesión anterior si era válida
-    if voice_valid_for_xp(before):
-        if member.id in voice_sessions:
-            _, _, join_ts = voice_sessions[member.id]
-            dur = now - join_ts
-            if dur >= VOICE_MIN_SECONDS:
-                mins = dur // 60
-                if mins > 0:
-                    st = get_or_create_user(member.id)
-                    st.xp += mins * VOICE_XP_PER_MIN
+    # Entró
+    if before.channel is None and after.channel is not None:
+        voice_upsert(member.id, member.guild.id, after.channel.id, now)
+        return
 
-                    # si quieres que voz también haga level-ups, descomenta:
-                    leveled_up = False
-                    old_level = st.level
-                    old_rank = rank_name_from_level(st.level)
-                    old_prestige = st.prestige
+    # Salió
+    if before.channel is not None and after.channel is None:
+        voice_delete(member.id)
+        return
 
-                    while True:
-                        need = xp_required_for_next_level(st.level)
-                        if st.xp >= need:
-                            st.xp -= need
-                            st.level += 1
-                            leveled_up = True
-                        else:
-                            break
+    # Cambio de canal
+    if before.channel is not None and after.channel is not None and before.channel.id != after.channel.id:
+        voice_upsert(member.id, member.guild.id, after.channel.id, now)
+        return
 
-                    prestiged = False
-                    if st.level > MAX_LEVEL_PER_PRESTIGE:
-                        st.prestige += 1
-                        st.level = 1
-                        st.xp = 0
-                        prestiged = True
+@tasks.loop(seconds=VOICE_TICK_SECONDS)
+async def voice_xp_loop():
+    if not VOICE_XP_ENABLED:
+        return
 
-                    update_user(st)
+    now = int(time.time())
 
-                    if leveled_up or prestiged:
-                        # manda anuncio al canal de rangos
-                        ch = get_rankup_channel(member.guild)
-                        fallback = ch or (member.guild.system_channel or None)
-                        if fallback:
-                            await announce_levelup(
-                                guild=member.guild,
-                                fallback_channel=fallback,
-                                member=member,
-                                old_level=old_level,
-                                new_level=st.level,
-                                old_rank=old_rank,
-                                new_rank=rank_name_from_level(st.level),
-                                prestige=st.prestige,
-                                prestiged=prestiged,
-                                old_prestige=old_prestige
-                            )
-        voice_sessions.pop(member.id, None)
+    for guild in bot.guilds:
+        # recorremos canales de voz y sus miembros (no depende de guild.members)
+        for vc in guild.voice_channels:
+            if VOICE_REQUIRE_2_HUMANS and humans_in_voice(vc) < 2:
+                continue
 
-    # abrir nueva sesión si ahora es válida
-    if voice_valid_for_xp(after):
-        voice_sessions[member.id] = (member.guild.id, after.channel.id, now)
+            for m in vc.members:
+                if not eligible_voice_member(m):
+                    continue
+
+                row = voice_get(m.id)
+                if not row:
+                    voice_upsert(m.id, guild.id, vc.id, now)
+                    continue
+
+                _, g_id, ch_id, last_tick = row
+
+                # si cambió algo, actualiza y sigue
+                if g_id != guild.id or ch_id != vc.id:
+                    voice_upsert(m.id, guild.id, vc.id, now)
+                    continue
+
+                if now - last_tick < VOICE_TICK_SECONDS:
+                    continue
+
+                gained = random.randint(VOICE_XP_MIN, VOICE_XP_MAX)
+                st = get_or_create_user(m.id)
+
+                leveled_up, prestiged, old_level, old_rank, old_prestige = apply_xp_and_levels(st, gained)
+                update_user(st)
+                voice_upsert(m.id, guild.id, vc.id, now)
+
+                if leveled_up or prestiged:
+                    new_rank = rank_name_from_level(st.level)
+                    await announce_levelup(
+                        guild=guild,
+                        member=m,
+                        old_level=old_level,
+                        new_level=st.level,
+                        old_rank=old_rank,
+                        new_rank=new_rank,
+                        prestige=st.prestige,
+                        prestiged=prestiged,
+                        old_prestige=old_prestige
+                    )
+
+@voice_xp_loop.before_loop
+async def before_voice_xp_loop():
+    await bot.wait_until_ready()
 
 # =========================
 # EVENTS
@@ -386,6 +430,10 @@ async def on_ready():
         await bot.tree.sync()
     except Exception:
         pass
+
+    if VOICE_XP_ENABLED and not voice_xp_loop.is_running():
+        voice_xp_loop.start()
+
     print(f"Bot listo como {bot.user}")
 
 @bot.event
@@ -394,7 +442,7 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
 
 # =========================
-# TEXT COMMANDS (dl!)
+# TEXT COMMANDS
 # =========================
 
 @bot.command(name="commands")
@@ -402,17 +450,15 @@ async def commands_list(ctx: commands.Context):
     prefix = get_guild_prefix(ctx.guild.id) if ctx.guild else DEFAULT_PREFIX
     msg = (
         f"**Comandos ({prefix})**\n"
-        f"- `{prefix}rank` → tu rango / nivel / xp (público)\n"
-        f"- `{prefix}top` → leaderboard (público)\n"
+        f"- `{prefix}rank` → tu rango / nivel / xp\n"
+        f"- `{prefix}top` → leaderboard\n"
         f"- `{prefix}setprefix <nuevo>` → cambia el prefijo (admin)\n"
-        f"- `{prefix}maxme` → te pone max rank (admin)\n"
-        f"- `{prefix}givexp @user <cantidad>` → dar XP manual (admin)\n\n"
-        "Slash commands:\n"
+        f"- `{prefix}maxme` → te pone max rank (solo admin)\n\n"
+        "Slash:\n"
         "- `/rank` (público)\n"
         "- `/leaderboard`\n"
         "- `/setprefix` (admin)\n"
         "- `/maxme` (admin)\n"
-        "- `/givexp` (admin)\n"
     )
     await ctx.reply(msg, mention_author=False)
 
@@ -454,66 +500,25 @@ async def setprefix_error(ctx: commands.Context, error):
         await ctx.reply("Necesitas **Manage Server** para cambiar el prefijo.", mention_author=False)
 
 @bot.command(name="maxme")
-@commands.has_permissions(administrator=True)
+@commands.has_permissions(manage_guild=True)
 async def maxme_cmd(ctx: commands.Context):
     st = get_or_create_user(ctx.author.id)
     st.prestige = 0
     st.level = MAX_LEVEL_PER_PRESTIGE
     st.xp = 0
     update_user(st)
-    await ctx.reply("Listo. Te puse en **max rank** 😈", mention_author=False)
+    await ctx.reply(f"Listo. Te puse en **Lv {st.level} ({rank_name_from_level(st.level)})**.", mention_author=False)
 
-@bot.command(name="givexp")
-@commands.has_permissions(administrator=True)
-async def givexp_cmd(ctx: commands.Context, member: discord.Member, amount: int):
-    amount = max(0, amount)
-    st = get_or_create_user(member.id)
-    st.xp += amount
-
-    leveled_up = False
-    old_level = st.level
-    old_rank = rank_name_from_level(st.level)
-    old_prestige = st.prestige
-
-    while True:
-        need = xp_required_for_next_level(st.level)
-        if st.xp >= need:
-            st.xp -= need
-            st.level += 1
-            leveled_up = True
-        else:
-            break
-
-    prestiged = False
-    if st.level > MAX_LEVEL_PER_PRESTIGE:
-        st.prestige += 1
-        st.level = 1
-        st.xp = 0
-        prestiged = True
-
-    update_user(st)
-
-    await ctx.reply(f"OK: le di **{amount} XP** a {member.mention}.", mention_author=False)
-
-    if leveled_up or prestiged:
-        await announce_levelup(
-            guild=ctx.guild,
-            fallback_channel=ctx.channel,
-            member=member,
-            old_level=old_level,
-            new_level=st.level,
-            old_rank=old_rank,
-            new_rank=rank_name_from_level(st.level),
-            prestige=st.prestige,
-            prestiged=prestiged,
-            old_prestige=old_prestige
-        )
+@maxme_cmd.error
+async def maxme_error(ctx: commands.Context, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.reply("Solo admin (Manage Server).", mention_author=False)
 
 # =========================
 # SLASH COMMANDS
 # =========================
 
-@bot.tree.command(name="rank", description="Muestra tu rango/nivel/xp")
+@bot.tree.command(name="rank", description="Muestra tu rango/nivel/xp (público)")
 async def rank_slash(interaction: discord.Interaction, user: Optional[discord.Member] = None):
     user = user or interaction.user
     st = get_or_create_user(user.id)
@@ -525,14 +530,13 @@ async def rank_slash(interaction: discord.Interaction, user: Optional[discord.Me
         description=f"Prestige **{st.prestige}**\nLv **{st.level}** • XP **{st.xp}/{need}**",
         color=discord.Color.blurple()
     )
-
     img_path = rank_image_from_level(st.level)
     if os.path.exists(img_path):
         file = discord.File(img_path, filename=os.path.basename(img_path))
         embed.set_thumbnail(url=f"attachment://{os.path.basename(img_path)}")
-        await interaction.response.send_message(embed=embed, file=file, ephemeral=False)  # <- PUBLICO
+        await interaction.response.send_message(embed=embed, file=file, ephemeral=False)
     else:
-        await interaction.response.send_message(embed=embed, ephemeral=False)  # <- PUBLICO
+        await interaction.response.send_message(embed=embed, ephemeral=False)
 
 @bot.tree.command(name="leaderboard", description="Top 10 del server")
 async def leaderboard_slash(interaction: discord.Interaction):
@@ -543,7 +547,7 @@ async def leaderboard_slash(interaction: discord.Interaction):
     embed = discord.Embed(title="🏆 Leaderboard", description="\n".join(lines), color=discord.Color.blurple())
     await interaction.response.send_message(embed=embed, ephemeral=False)
 
-@bot.tree.command(name="setprefix", description="Cambia el prefijo de comandos de texto (admin)")
+@bot.tree.command(name="setprefix", description="Cambia el prefijo (admin)")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def setprefix_slash(interaction: discord.Interaction, new_prefix: str):
     if len(new_prefix) > 8:
@@ -555,64 +559,18 @@ async def setprefix_slash(interaction: discord.Interaction, new_prefix: str):
     set_guild_prefix(interaction.guild.id, new_prefix)
     await interaction.response.send_message(f"Listo. Nuevo prefijo: `{new_prefix}`", ephemeral=True)
 
-@bot.tree.command(name="maxme", description="Te pone max rank (admin)")
-@app_commands.checks.has_permissions(administrator=True)
+@bot.tree.command(name="maxme", description="Te pone max level (admin)")
+@app_commands.checks.has_permissions(manage_guild=True)
 async def maxme_slash(interaction: discord.Interaction):
     st = get_or_create_user(interaction.user.id)
     st.prestige = 0
     st.level = MAX_LEVEL_PER_PRESTIGE
     st.xp = 0
     update_user(st)
-    await interaction.response.send_message("Listo. Te puse en **max rank** 😈", ephemeral=True)
-
-@bot.tree.command(name="givexp", description="Dar XP manual (admin)")
-@app_commands.checks.has_permissions(administrator=True)
-async def givexp_slash(interaction: discord.Interaction, user: discord.Member, amount: int):
-    amount = max(0, amount)
-    st = get_or_create_user(user.id)
-    st.xp += amount
-
-    leveled_up = False
-    old_level = st.level
-    old_rank = rank_name_from_level(st.level)
-    old_prestige = st.prestige
-
-    while True:
-        need = xp_required_for_next_level(st.level)
-        if st.xp >= need:
-            st.xp -= need
-            st.level += 1
-            leveled_up = True
-        else:
-            break
-
-    prestiged = False
-    if st.level > MAX_LEVEL_PER_PRESTIGE:
-        st.prestige += 1
-        st.level = 1
-        st.xp = 0
-        prestiged = True
-
-    update_user(st)
-
-    await interaction.response.send_message(f"OK: le di **{amount} XP** a {user.mention}.", ephemeral=True)
-
-    if leveled_up or prestiged and interaction.guild:
-        # anunciar en canal de rangos
-        ch = get_rankup_channel(interaction.guild)
-        if ch:
-            await announce_levelup(
-                guild=interaction.guild,
-                fallback_channel=ch,
-                member=user,
-                old_level=old_level,
-                new_level=st.level,
-                old_rank=old_rank,
-                new_rank=rank_name_from_level(st.level),
-                prestige=st.prestige,
-                prestiged=prestiged,
-                old_prestige=old_prestige
-            )
+    await interaction.response.send_message(
+        f"Listo. Te puse en **Lv {st.level} ({rank_name_from_level(st.level)})**.",
+        ephemeral=True
+    )
 
 # =========================
 # MAIN
