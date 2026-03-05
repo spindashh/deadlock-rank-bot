@@ -1,30 +1,30 @@
 {
   "version": 1,
-  "ts": 1772690205,
+  "ts": 1772690250,
   "users": [
     {
       "user_id": 255178819089072129,
-      "xp": 12,
+      "xp": 26,
       "level": 1,
       "prestige": 0,
       "last_msg_xp_ts": 0,
-      "last_voice_xp_ts": 1772690056
+      "last_voice_xp_ts": 1772690249
     },
     {
       "user_id": 374003283888701450,
-      "xp": 13,
+      "xp": 27,
       "level": 1,
       "prestige": 0,
       "last_msg_xp_ts": 0,
-      "last_voice_xp_ts": 1772690056
+      "last_voice_xp_ts": 1772690249
     },
     {
       "user_id": 409542541386579979,
-      "xp": 14,
+      "xp": 24,
       "level": 1,
       "prestige": 0,
       "last_msg_xp_ts": 0,
-      "last_voice_xp_ts": 1772690056
+      "last_voice_xp_ts": 1772690249
     }
   ],
   "settings": []
