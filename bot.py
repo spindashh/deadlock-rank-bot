@@ -11,16 +11,16 @@ from discord.ext import commands, tasks
 from discord import app_commands
 
 # =========================
-# CONFIG
+# CONFIG (ENV VARS)
 # =========================
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
 # GitHub backup (Contents API)
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")          # classic token con scope repo
-GITHUB_REPO = os.getenv("GITHUB_REPO")            # ej: "spindashh/deadlock-rank-bot"
-GITHUB_BACKUP_PATH = os.getenv("GITHUB_BACKUP_PATH", "backup/data.db")  # en tu repo
-BACKUP_EVERY_SECONDS = int(os.getenv("BACKUP_EVERY_SECONDS", "300"))     # 5 min default
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")  # classic token con scope repo
+GITHUB_REPO = os.getenv("GITHUB_REPO")    # ej: "spindashh/deadlock-rank-bot"
+GITHUB_BACKUP_PATH = os.getenv("GITHUB_BACKUP_PATH", "backup/data.db")
+BACKUP_EVERY_SECONDS = int(os.getenv("BACKUP_EVERY_SECONDS", "300"))  # 5 min default
 
 # Rankups channel
 RANKUP_CHANNEL_ID = int(os.getenv("RANKUP_CHANNEL_ID", "0"))
@@ -28,21 +28,21 @@ RANKUP_CHANNEL_ID = int(os.getenv("RANKUP_CHANNEL_ID", "0"))
 # DB file
 DB_PATH = os.getenv("DB_PATH", "data.db")
 
-# XP tuning
+# XP tuning (mensajes)
 MSG_XP_MIN = int(os.getenv("MSG_XP_MIN", "8"))
 MSG_XP_MAX = int(os.getenv("MSG_XP_MAX", "16"))
 MSG_COOLDOWN_SECONDS = int(os.getenv("MSG_COOLDOWN_SECONDS", "45"))
 
+# XP tuning (voice)
 VOICE_XP_EVERY_SECONDS = int(os.getenv("VOICE_XP_EVERY_SECONDS", "180"))  # 3 min
 VOICE_XP_PER_TICK = int(os.getenv("VOICE_XP_PER_TICK", "12"))
 
 # Level curve
-# XP needed for next level: base + (level * step)
 XP_BASE = int(os.getenv("XP_BASE", "250"))
 XP_STEP = int(os.getenv("XP_STEP", "60"))
 
-# Max level (para /maxme)
-MAX_LEVEL = int(os.getenv("MAX_LEVEL", "30"))
+# Max level (ETERNUS)
+MAX_LEVEL = int(os.getenv("MAX_LEVEL", "110"))
 
 # =========================
 # DISCORD SETUP
@@ -55,12 +55,12 @@ intents.members = True
 intents.voice_states = True
 
 def dynamic_prefix(bot: commands.Bot, message: discord.Message):
-    return "!"  # por si quieres comandos prefijo; los slash son los importantes
+    return "!"
 
 bot = commands.Bot(command_prefix=dynamic_prefix, intents=intents, help_command=None)
 
 # =========================
-# DB
+# DB HELPERS
 # =========================
 
 def db_connect():
@@ -69,6 +69,10 @@ def db_connect():
     return con
 
 def db_init():
+    """
+    Crea tabla y aplica migraciones para DB viejas
+    (esto evita el crash: 'no column named last_msg_ts')
+    """
     with db_connect() as con:
         con.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -81,17 +85,29 @@ def db_init():
         """)
         con.commit()
 
+        # ---- MIGRATIONS (para DB viejas) ----
+        cur = con.execute("PRAGMA table_info(users)")
+        cols = {row[1] for row in cur.fetchall()}
+
+        # Si tu DB vieja no tenía last_msg_ts, se la agregamos.
+        if "last_msg_ts" not in cols:
+            con.execute("ALTER TABLE users ADD COLUMN last_msg_ts REAL NOT NULL DEFAULT 0")
+            con.commit()
+            print("[db] Migrated: added column last_msg_ts")
+
 def get_or_create_user(user_id: int) -> sqlite3.Row:
     with db_connect() as con:
         cur = con.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
         row = cur.fetchone()
         if row:
             return row
+
         con.execute(
             "INSERT INTO users (user_id, xp, level, prestige, last_msg_ts) VALUES (?, 0, 1, 0, 0)",
             (user_id,)
         )
         con.commit()
+
         cur = con.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
         return cur.fetchone()
 
@@ -105,6 +121,7 @@ def update_user(
 ):
     fields = []
     values = []
+
     if xp is not None:
         fields.append("xp=?")
         values.append(int(xp))
@@ -117,8 +134,10 @@ def update_user(
     if last_msg_ts is not None:
         fields.append("last_msg_ts=?")
         values.append(float(last_msg_ts))
+
     if not fields:
         return
+
     values.append(user_id)
     with db_connect() as con:
         con.execute(f"UPDATE users SET {', '.join(fields)} WHERE user_id=?", tuple(values))
@@ -136,17 +155,21 @@ def top_users(limit: int = 10) -> List[sqlite3.Row]:
 # =========================
 # RANK LOGIC
 # =========================
+# Rangos cada ~10 niveles, max = ETERNUS (lvl 110)
+# Tus imágenes: ranks/01_initiate.png ... ranks/11_eternus.png
 
 RANK_TITLES = [
-    (1,  "Initiate"),
-    (3,  "Seeker"),
-    (5,  "Alchemist"),
-    (8,  "Arcanist"),
-    (11, "Ritualist"),
-    (15, "Emissary"),
-    (20, "Archon"),
-    (25, "Oracle"),
-    (30, "Phantom"),
+    (1,   "Initiate"),
+    (10,  "Seeker"),
+    (20,  "Alchemist"),
+    (30,  "Arcanist"),
+    (40,  "Ritualist"),
+    (50,  "Emissary"),
+    (60,  "Archon"),
+    (70,  "Oracle"),
+    (80,  "Phantom"),
+    (90,  "Ascendant"),
+    (110, "Eternus"),
 ]
 
 def rank_name_from_level(level: int) -> str:
@@ -160,15 +183,17 @@ def xp_required_for_next_level(level: int) -> int:
     return XP_BASE + (level * XP_STEP)
 
 def rank_image_from_level(level: int) -> str:
-    # Asume que tienes ranks/01_initiate.png ... etc
-    if level >= 30: return "ranks/09_phantom.png"
-    if level >= 25: return "ranks/08_oracle.png"
-    if level >= 20: return "ranks/07_archon.png"
-    if level >= 15: return "ranks/06_emissary.png"
-    if level >= 11: return "ranks/05_ritualist.png"
-    if level >= 8:  return "ranks/04_arcanist.png"
-    if level >= 5:  return "ranks/03_alchemist.png"
-    if level >= 3:  return "ranks/02_seeker.png"
+    # Ajustado a tus archivos
+    if level >= 110: return "ranks/11_eternus.png"
+    if level >= 90:  return "ranks/10_ascendant.png"
+    if level >= 80:  return "ranks/09_phantom.png"
+    if level >= 70:  return "ranks/08_oracle.png"
+    if level >= 60:  return "ranks/07_archon.png"
+    if level >= 50:  return "ranks/06_emissary.png"
+    if level >= 40:  return "ranks/05_ritualist.png"
+    if level >= 30:  return "ranks/04_arcanist.png"
+    if level >= 20:  return "ranks/03_alchemist.png"
+    if level >= 10:  return "ranks/02_seeker.png"
     return "ranks/01_initiate.png"
 
 async def announce_rankup(member: discord.Member, new_level: int, prestige: int):
@@ -216,14 +241,10 @@ def github_headers():
     }
 
 async def github_download_db_if_exists() -> bool:
-    """
-    Download backup/data.db from GitHub if it exists, write to DB_PATH.
-    Returns True if downloaded, False if not found or not configured.
-    """
     if not (GITHUB_TOKEN and GITHUB_REPO and GITHUB_BACKUP_PATH):
         return False
 
-    import requests  # needs in requirements.txt
+    import requests
 
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_BACKUP_PATH}"
     try:
@@ -246,20 +267,15 @@ async def github_download_db_if_exists() -> bool:
         return False
 
 async def github_upload_db() -> bool:
-    """
-    Upload local DB_PATH to GitHub at GITHUB_BACKUP_PATH.
-    Returns True on success.
-    """
     if not (GITHUB_TOKEN and GITHUB_REPO and GITHUB_BACKUP_PATH):
         return False
 
-    import requests  # needs in requirements.txt
+    import requests
 
     if not os.path.exists(DB_PATH):
         return False
 
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_BACKUP_PATH}"
-
     try:
         sha = None
         get_r = requests.get(url, headers=github_headers(), timeout=20)
@@ -271,10 +287,7 @@ async def github_upload_db() -> bool:
         with open(DB_PATH, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("utf-8")
 
-        payload = {
-            "message": "Auto-backup data.db",
-            "content": b64
-        }
+        payload = {"message": "Auto-backup data.db", "content": b64}
         if sha:
             payload["sha"] = sha
 
@@ -288,11 +301,46 @@ async def github_upload_db() -> bool:
 
 @tasks.loop(seconds=BACKUP_EVERY_SECONDS)
 async def backup_loop():
-    # ✅ NO dejar que un fallo de GitHub tumbe el bot y cause restart-loop
     try:
         await github_upload_db()
     except Exception as e:
-        print("[backup] error:", e)
+        print(f"[backup] Loop error: {e}")
+
+# =========================
+# VOICE XP LOOP
+# =========================
+
+def eligible_voice_member(m: discord.Member) -> bool:
+    if m.bot:
+        return False
+    if not m.voice or not m.voice.channel:
+        return False
+    # opcional: no dar XP si está deaf
+    if m.voice.self_deaf or m.voice.deaf:
+        return False
+    return True
+
+@tasks.loop(seconds=VOICE_XP_EVERY_SECONDS)
+async def voice_xp_loop():
+    # IMPORTANTE: try por guild/miembro para que NO muera el task
+    for guild in bot.guilds:
+        try:
+            for vc in guild.voice_channels:
+                for member in vc.members:
+                    try:
+                        if not eligible_voice_member(member):
+                            continue
+
+                        st = get_or_create_user(member.id)
+                        old_level = int(st["level"])
+                        xp, level, prestige, leveled_up = apply_xp_and_levelup(member.id, VOICE_XP_PER_TICK)
+
+                        if leveled_up and level != old_level:
+                            await announce_rankup(member, level, prestige)
+                    except Exception as e:
+                        print(f"[voice] member error {member.id}: {e}")
+        except Exception as e:
+            print(f"[voice] guild error {guild.id}: {e}")
 
 # =========================
 # EVENTS
@@ -300,10 +348,13 @@ async def backup_loop():
 
 @bot.event
 async def on_ready():
-    db_init()
+    # 1) restore db si existe
     await github_download_db_if_exists()
+
+    # 2) init + migraciones
     db_init()
 
+    # 3) sync commands
     try:
         synced = await bot.tree.sync()
         print(f"[sync] Synced {len(synced)} commands.")
@@ -320,9 +371,7 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: discord.Message):
-    if message.author.bot:
-        return
-    if not message.guild:
+    if message.author.bot or not message.guild:
         return
 
     user_id = message.author.id
@@ -343,35 +392,6 @@ async def on_message(message: discord.Message):
         await announce_rankup(message.author, level, prestige)
 
 # =========================
-# VOICE XP LOOP
-# =========================
-
-def eligible_voice_member(m: discord.Member) -> bool:
-    if m.bot:
-        return False
-    if not m.voice:
-        return False
-    if not m.voice.channel:
-        return False
-    if m.voice.self_deaf or m.voice.deaf:
-        return False
-    return True
-
-@tasks.loop(seconds=VOICE_XP_EVERY_SECONDS)
-async def voice_xp_loop():
-    for guild in bot.guilds:
-        for vc in guild.voice_channels:
-            for member in vc.members:
-                if not eligible_voice_member(member):
-                    continue
-
-                st = get_or_create_user(member.id)
-                old_level = int(st["level"])
-                xp, level, prestige, leveled_up = apply_xp_and_levelup(member.id, VOICE_XP_PER_TICK)
-                if leveled_up and level != old_level:
-                    await announce_rankup(member, level, prestige)
-
-# =========================
 # SLASH COMMANDS
 # =========================
 
@@ -380,11 +400,17 @@ def make_rank_embed(member: discord.Member, st: sqlite3.Row) -> discord.Embed:
     xp = int(st["xp"])
     prestige = int(st["prestige"])
     rank = rank_name_from_level(lvl)
-    need = xp_required_for_next_level(lvl)
+    need = xp_required_for_next_level(lvl) if lvl < MAX_LEVEL else 0
+
+    desc = f"Prestige **{prestige}**\nLv **{lvl}**"
+    if lvl < MAX_LEVEL:
+        desc += f" • XP **{xp}/{need}**"
+    else:
+        desc += f" • XP **MAX**"
 
     embed = discord.Embed(
         title=f"{member.display_name} • {rank}",
-        description=f"Prestige **{prestige}**\nLv **{lvl}** • XP **{xp}/{need}**",
+        description=desc,
         color=discord.Color.purple()
     )
     embed.set_footer(text="Deadlock Chat Ranks")
@@ -395,7 +421,6 @@ def make_rank_embed(member: discord.Member, st: sqlite3.Row) -> discord.Embed:
 async def rank_slash(interaction: discord.Interaction, user: Optional[discord.Member] = None):
     user = user or interaction.user
     st = get_or_create_user(user.id)
-
     embed = make_rank_embed(user, st)
 
     img_path = rank_image_from_level(int(st["level"]))
@@ -426,30 +451,27 @@ async def leaderboard_slash(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=False)
 
 def is_admin(member: discord.Member) -> bool:
-    # ✅ admins (permiso administrador)
+    # Admin = permiso Administrator (lo que tú pediste)
     return member.guild_permissions.administrator
 
 @bot.tree.command(name="maxme", description="(Admin) Te pone en el nivel máximo")
 async def maxme_slash(interaction: discord.Interaction):
     if not isinstance(interaction.user, discord.Member):
-        await interaction.response.send_message("No pude validar tus permisos.", ephemeral=True)
+        await interaction.response.send_message("No pude validar permisos.", ephemeral=True)
         return
 
     if not is_admin(interaction.user):
-        await interaction.response.send_message("⛔ Solo un **Admin** puede usar este comando.", ephemeral=True)
+        await interaction.response.send_message("⛔ Solo **admins** pueden usar este comando.", ephemeral=True)
         return
 
     update_user(interaction.user.id, level=MAX_LEVEL, xp=0)
     title = rank_name_from_level(MAX_LEVEL)
-    await interaction.response.send_message(
-        f"👑 Listo. Ahora eres **Lv {MAX_LEVEL}** ({title}).",
-        ephemeral=True
-    )
+    await interaction.response.send_message(f"👑 Listo. Ahora eres **Lv {MAX_LEVEL}** ({title}).", ephemeral=True)
 
 @bot.tree.command(name="backupnow", description="(Admin) Fuerza un backup ahora mismo")
 async def backupnow_slash(interaction: discord.Interaction):
     if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
-        await interaction.response.send_message("⛔ Solo un **Admin** puede usar esto.", ephemeral=True)
+        await interaction.response.send_message("⛔ Solo **admins** pueden usar esto.", ephemeral=True)
         return
 
     ok = await github_upload_db()
