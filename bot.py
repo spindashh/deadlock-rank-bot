@@ -1,9 +1,6 @@
 import os
 import time
-import json
-import base64
 import sqlite3
-import asyncio
 from typing import Optional, List, Tuple
 
 import discord
@@ -15,12 +12,6 @@ from discord import app_commands
 # =========================
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-
-# GitHub backup (Contents API)
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")  # classic token con scope repo
-GITHUB_REPO = os.getenv("GITHUB_REPO")    # ej: "spindashh/deadlock-rank-bot"
-GITHUB_BACKUP_PATH = os.getenv("GITHUB_BACKUP_PATH", "backup/data.db")
-BACKUP_EVERY_SECONDS = int(os.getenv("BACKUP_EVERY_SECONDS", "300"))  # 5 min default
 
 # Rankups channel
 RANKUP_CHANNEL_ID = int(os.getenv("RANKUP_CHANNEL_ID", "0"))
@@ -231,82 +222,6 @@ def apply_xp_and_levelup(user_id: int, add_xp: int) -> Tuple[int, int, int, bool
     return xp, level, prestige, leveled_up
 
 # =========================
-# GITHUB BACKUP / RESTORE
-# =========================
-
-def github_headers():
-    return {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json"
-    }
-
-async def github_download_db_if_exists() -> bool:
-    if not (GITHUB_TOKEN and GITHUB_REPO and GITHUB_BACKUP_PATH):
-        return False
-
-    import requests
-
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_BACKUP_PATH}"
-    try:
-        r = requests.get(url, headers=github_headers(), timeout=20)
-        if r.status_code == 404:
-            print("[backup] No backup found on GitHub (first run).")
-            return False
-        r.raise_for_status()
-        data = r.json()
-        content_b64 = data.get("content", "")
-        if not content_b64:
-            return False
-        raw = base64.b64decode(content_b64)
-        with open(DB_PATH, "wb") as f:
-            f.write(raw)
-        print("[backup] Restored data.db from GitHub.")
-        return True
-    except Exception as e:
-        print(f"[backup] Restore failed: {e}")
-        return False
-
-async def github_upload_db() -> bool:
-    if not (GITHUB_TOKEN and GITHUB_REPO and GITHUB_BACKUP_PATH):
-        return False
-
-    import requests
-
-    if not os.path.exists(DB_PATH):
-        return False
-
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_BACKUP_PATH}"
-    try:
-        sha = None
-        get_r = requests.get(url, headers=github_headers(), timeout=20)
-        if get_r.status_code == 200:
-            sha = get_r.json().get("sha")
-        elif get_r.status_code != 404:
-            get_r.raise_for_status()
-
-        with open(DB_PATH, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("utf-8")
-
-        payload = {"message": "Auto-backup data.db", "content": b64}
-        if sha:
-            payload["sha"] = sha
-
-        put_r = requests.put(url, headers=github_headers(), data=json.dumps(payload), timeout=25)
-        put_r.raise_for_status()
-        print("[backup] Uploaded data.db to GitHub.")
-        return True
-    except Exception as e:
-        print(f"[backup] Upload failed: {e}")
-        return False
-
-@tasks.loop(seconds=BACKUP_EVERY_SECONDS)
-async def backup_loop():
-    try:
-        await github_upload_db()
-    except Exception as e:
-        print(f"[backup] Loop error: {e}")
-
-# =========================
 # VOICE XP LOOP
 # =========================
 
@@ -348,21 +263,15 @@ async def voice_xp_loop():
 
 @bot.event
 async def on_ready():
-    # 1) restore db si existe
-    await github_download_db_if_exists()
-
-    # 2) init + migraciones
+    # init + migraciones
     db_init()
 
-    # 3) sync commands
+    # sync commands
     try:
         synced = await bot.tree.sync()
         print(f"[sync] Synced {len(synced)} commands.")
     except Exception as e:
         print(f"[sync] Failed: {e}")
-
-    if not backup_loop.is_running():
-        backup_loop.start()
 
     if not voice_xp_loop.is_running():
         voice_xp_loop.start()
@@ -451,7 +360,7 @@ async def leaderboard_slash(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=False)
 
 def is_admin(member: discord.Member) -> bool:
-    # Admin = permiso Administrator (lo que tú pediste)
+    # Admin = permiso Administrator
     return member.guild_permissions.administrator
 
 @bot.tree.command(name="maxme", description="(Admin) Te pone en el nivel máximo")
@@ -467,18 +376,6 @@ async def maxme_slash(interaction: discord.Interaction):
     update_user(interaction.user.id, level=MAX_LEVEL, xp=0)
     title = rank_name_from_level(MAX_LEVEL)
     await interaction.response.send_message(f"👑 Listo. Ahora eres **Lv {MAX_LEVEL}** ({title}).", ephemeral=True)
-
-@bot.tree.command(name="backupnow", description="(Admin) Fuerza un backup ahora mismo")
-async def backupnow_slash(interaction: discord.Interaction):
-    if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
-        await interaction.response.send_message("⛔ Solo **admins** pueden usar esto.", ephemeral=True)
-        return
-
-    ok = await github_upload_db()
-    await interaction.response.send_message(
-        "✅ Backup hecho." if ok else "⚠️ No se pudo hacer el backup (revisa env vars/logs).",
-        ephemeral=True
-    )
 
 # =========================
 # STARTUP
