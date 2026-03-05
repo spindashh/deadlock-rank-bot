@@ -41,8 +41,8 @@ VOICE_XP_PER_TICK = int(os.getenv("VOICE_XP_PER_TICK", "12"))
 XP_BASE = int(os.getenv("XP_BASE", "250"))
 XP_STEP = int(os.getenv("XP_STEP", "60"))
 
-# ✅ Max level real (Eternus)
-MAX_LEVEL = int(os.getenv("MAX_LEVEL", "110"))
+# Max level (para /maxme)
+MAX_LEVEL = int(os.getenv("MAX_LEVEL", "30"))
 
 # =========================
 # DISCORD SETUP
@@ -87,7 +87,10 @@ def get_or_create_user(user_id: int) -> sqlite3.Row:
         row = cur.fetchone()
         if row:
             return row
-        con.execute("INSERT INTO users (user_id, xp, level, prestige, last_msg_ts) VALUES (?, 0, 1, 0, 0)", (user_id,))
+        con.execute(
+            "INSERT INTO users (user_id, xp, level, prestige, last_msg_ts) VALUES (?, 0, 1, 0, 0)",
+            (user_id,)
+        )
         con.commit()
         cur = con.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
         return cur.fetchone()
@@ -134,18 +137,16 @@ def top_users(limit: int = 10) -> List[sqlite3.Row]:
 # RANK LOGIC
 # =========================
 
-# ✅ Cada ~10 niveles, Eternus en 110
 RANK_TITLES = [
-    (1,   "Initiate"),
-    (10,  "Seeker"),
-    (20,  "Alchemist"),
-    (30,  "Arcanist"),
-    (40,  "Ritualist"),
-    (50,  "Emissary"),
-    (60,  "Archon"),
-    (80,  "Oracle"),
-    (100, "Phantom"),
-    (110, "Eternus"),
+    (1,  "Initiate"),
+    (3,  "Seeker"),
+    (5,  "Alchemist"),
+    (8,  "Arcanist"),
+    (11, "Ritualist"),
+    (15, "Emissary"),
+    (20, "Archon"),
+    (25, "Oracle"),
+    (30, "Phantom"),
 ]
 
 def rank_name_from_level(level: int) -> str:
@@ -159,17 +160,15 @@ def xp_required_for_next_level(level: int) -> int:
     return XP_BASE + (level * XP_STEP)
 
 def rank_image_from_level(level: int) -> str:
-    # ✅ tus archivos: ranks/01...11 (incluye 11_eternus.png)
-    if level >= 110: return "ranks/11_eternus.png"
-    if level >= 100: return "ranks/10_ascendant.png"
-    if level >= 80:  return "ranks/09_phantom.png"
-    if level >= 60:  return "ranks/08_oracle.png"
-    if level >= 50:  return "ranks/07_archon.png"
-    if level >= 40:  return "ranks/06_emissary.png"
-    if level >= 30:  return "ranks/05_ritualist.png"
-    if level >= 20:  return "ranks/04_arcanist.png"
-    if level >= 10:  return "ranks/03_alchemist.png"
-    if level >= 5:   return "ranks/02_seeker.png"
+    # Asume que tienes ranks/01_initiate.png ... etc
+    if level >= 30: return "ranks/09_phantom.png"
+    if level >= 25: return "ranks/08_oracle.png"
+    if level >= 20: return "ranks/07_archon.png"
+    if level >= 15: return "ranks/06_emissary.png"
+    if level >= 11: return "ranks/05_ritualist.png"
+    if level >= 8:  return "ranks/04_arcanist.png"
+    if level >= 5:  return "ranks/03_alchemist.png"
+    if level >= 3:  return "ranks/02_seeker.png"
     return "ranks/01_initiate.png"
 
 async def announce_rankup(member: discord.Member, new_level: int, prestige: int):
@@ -217,10 +216,14 @@ def github_headers():
     }
 
 async def github_download_db_if_exists() -> bool:
+    """
+    Download backup/data.db from GitHub if it exists, write to DB_PATH.
+    Returns True if downloaded, False if not found or not configured.
+    """
     if not (GITHUB_TOKEN and GITHUB_REPO and GITHUB_BACKUP_PATH):
         return False
 
-    import requests
+    import requests  # needs in requirements.txt
 
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_BACKUP_PATH}"
     try:
@@ -243,10 +246,14 @@ async def github_download_db_if_exists() -> bool:
         return False
 
 async def github_upload_db() -> bool:
+    """
+    Upload local DB_PATH to GitHub at GITHUB_BACKUP_PATH.
+    Returns True on success.
+    """
     if not (GITHUB_TOKEN and GITHUB_REPO and GITHUB_BACKUP_PATH):
         return False
 
-    import requests
+    import requests  # needs in requirements.txt
 
     if not os.path.exists(DB_PATH):
         return False
@@ -281,7 +288,11 @@ async def github_upload_db() -> bool:
 
 @tasks.loop(seconds=BACKUP_EVERY_SECONDS)
 async def backup_loop():
-    await github_upload_db()
+    # ✅ NO dejar que un fallo de GitHub tumbe el bot y cause restart-loop
+    try:
+        await github_upload_db()
+    except Exception as e:
+        print("[backup] error:", e)
 
 # =========================
 # EVENTS
@@ -338,7 +349,9 @@ async def on_message(message: discord.Message):
 def eligible_voice_member(m: discord.Member) -> bool:
     if m.bot:
         return False
-    if not m.voice or not m.voice.channel:
+    if not m.voice:
+        return False
+    if not m.voice.channel:
         return False
     if m.voice.self_deaf or m.voice.deaf:
         return False
@@ -351,6 +364,7 @@ async def voice_xp_loop():
             for member in vc.members:
                 if not eligible_voice_member(member):
                     continue
+
                 st = get_or_create_user(member.id)
                 old_level = int(st["level"])
                 xp, level, prestige, leveled_up = apply_xp_and_levelup(member.id, VOICE_XP_PER_TICK)
@@ -412,31 +426,37 @@ async def leaderboard_slash(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=False)
 
 def is_admin(member: discord.Member) -> bool:
-    # ✅ Solo admins (permiso administrador)
+    # ✅ admins (permiso administrador)
     return member.guild_permissions.administrator
 
 @bot.tree.command(name="maxme", description="(Admin) Te pone en el nivel máximo")
 async def maxme_slash(interaction: discord.Interaction):
     if not isinstance(interaction.user, discord.Member):
-        await interaction.response.send_message("No pude validar tu usuario.", ephemeral=True)
+        await interaction.response.send_message("No pude validar tus permisos.", ephemeral=True)
         return
 
     if not is_admin(interaction.user):
-        await interaction.response.send_message("⛔ Solo **Admins** pueden usar este comando.", ephemeral=True)
+        await interaction.response.send_message("⛔ Solo un **Admin** puede usar este comando.", ephemeral=True)
         return
 
     update_user(interaction.user.id, level=MAX_LEVEL, xp=0)
     title = rank_name_from_level(MAX_LEVEL)
-    await interaction.response.send_message(f"👑 Listo. Ahora eres **Lv {MAX_LEVEL}** ({title}).", ephemeral=True)
+    await interaction.response.send_message(
+        f"👑 Listo. Ahora eres **Lv {MAX_LEVEL}** ({title}).",
+        ephemeral=True
+    )
 
 @bot.tree.command(name="backupnow", description="(Admin) Fuerza un backup ahora mismo")
 async def backupnow_slash(interaction: discord.Interaction):
     if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
-        await interaction.response.send_message("⛔ Solo **Admins** pueden usar esto.", ephemeral=True)
+        await interaction.response.send_message("⛔ Solo un **Admin** puede usar esto.", ephemeral=True)
         return
 
     ok = await github_upload_db()
-    await interaction.response.send_message("✅ Backup hecho." if ok else "⚠️ No se pudo hacer el backup (revisa env vars/logs).", ephemeral=True)
+    await interaction.response.send_message(
+        "✅ Backup hecho." if ok else "⚠️ No se pudo hacer el backup (revisa env vars/logs).",
+        ephemeral=True
+    )
 
 # =========================
 # STARTUP
