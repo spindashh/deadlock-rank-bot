@@ -28,9 +28,9 @@ MSG_COOLDOWN_SECONDS = int(os.getenv("MSG_COOLDOWN_SECONDS", "45"))
 VOICE_XP_EVERY_SECONDS = int(os.getenv("VOICE_XP_EVERY_SECONDS", "180"))  # 3 min
 VOICE_XP_PER_TICK = int(os.getenv("VOICE_XP_PER_TICK", "12"))
 
-# Level curve
-XP_BASE = int(os.getenv("XP_BASE", "250"))
-XP_STEP = int(os.getenv("XP_STEP", "60"))
+# Level curve (⬇️ SOLO CAMBIO: default más rápido como antes)
+XP_BASE = int(os.getenv("XP_BASE", "140"))
+XP_STEP = int(os.getenv("XP_STEP", "30"))
 
 # Max level (ETERNUS)
 MAX_LEVEL = int(os.getenv("MAX_LEVEL", "110"))
@@ -144,10 +144,8 @@ def top_users(limit: int = 10) -> List[sqlite3.Row]:
         return cur.fetchall()
 
 # =========================
-# RANK LOGIC
+# RANK LOGIC (SIN CAMBIOS)
 # =========================
-# Rangos cada ~10 niveles, max = ETERNUS (lvl 110)
-# Tus imágenes: ranks/01_initiate.png ... ranks/11_eternus.png
 
 RANK_TITLES = [
     (1,   "Initiate"),
@@ -174,7 +172,6 @@ def xp_required_for_next_level(level: int) -> int:
     return XP_BASE + (level * XP_STEP)
 
 def rank_image_from_level(level: int) -> str:
-    # Ajustado a tus archivos
     if level >= 110: return "ranks/11_eternus.png"
     if level >= 90:  return "ranks/10_ascendant.png"
     if level >= 80:  return "ranks/09_phantom.png"
@@ -187,22 +184,41 @@ def rank_image_from_level(level: int) -> str:
     if level >= 10:  return "ranks/02_seeker.png"
     return "ranks/01_initiate.png"
 
+# =========================
+# RANKUP MESSAGE (⬇️ SOLO CAMBIO: volver al embed con imagen + prestige)
+# =========================
+
 async def announce_rankup(member: discord.Member, new_level: int, prestige: int):
     if not RANKUP_CHANNEL_ID:
         return
+
     ch = member.guild.get_channel(RANKUP_CHANNEL_ID)
     if not ch:
         return
+
     try:
         title = rank_name_from_level(new_level)
-        await ch.send(f"🔺 {member.mention} subió a **Lv {new_level}** ({title}) | Prestige **{prestige}**")
+
+        embed = discord.Embed(
+            title="⚡ RANK UP",
+            description=f"{member.mention} subió a **Lv {new_level} ({title})**",
+            color=discord.Color.purple()
+        )
+        embed.add_field(name="Prestige", value=str(prestige), inline=True)
+        embed.set_footer(text="Deadlock Chat Ranks • XP por actividad")
+
+        img_path = rank_image_from_level(new_level)
+        if os.path.exists(img_path):
+            file = discord.File(img_path, filename=os.path.basename(img_path))
+            embed.set_thumbnail(url=f"attachment://{os.path.basename(img_path)}")
+            await ch.send(embed=embed, file=file)
+        else:
+            await ch.send(embed=embed)
+
     except Exception:
         pass
 
 def apply_xp_and_levelup(user_id: int, add_xp: int) -> Tuple[int, int, int, bool]:
-    """
-    Returns: (new_xp, new_level, prestige, leveled_up)
-    """
     st = get_or_create_user(user_id)
     xp = int(st["xp"]) + int(add_xp)
     level = int(st["level"])
@@ -222,7 +238,7 @@ def apply_xp_and_levelup(user_id: int, add_xp: int) -> Tuple[int, int, int, bool
     return xp, level, prestige, leveled_up
 
 # =========================
-# VOICE XP LOOP
+# VOICE XP LOOP (YA ESTÁ ACTIVO)
 # =========================
 
 def eligible_voice_member(m: discord.Member) -> bool:
@@ -230,14 +246,12 @@ def eligible_voice_member(m: discord.Member) -> bool:
         return False
     if not m.voice or not m.voice.channel:
         return False
-    # opcional: no dar XP si está deaf
     if m.voice.self_deaf or m.voice.deaf:
         return False
     return True
 
 @tasks.loop(seconds=VOICE_XP_EVERY_SECONDS)
 async def voice_xp_loop():
-    # IMPORTANTE: try por guild/miembro para que NO muera el task
     for guild in bot.guilds:
         try:
             for vc in guild.voice_channels:
@@ -263,10 +277,8 @@ async def voice_xp_loop():
 
 @bot.event
 async def on_ready():
-    # init + migraciones
     db_init()
 
-    # sync commands
     try:
         synced = await bot.tree.sync()
         print(f"[sync] Synced {len(synced)} commands.")
@@ -360,7 +372,6 @@ async def leaderboard_slash(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=False)
 
 def is_admin(member: discord.Member) -> bool:
-    # Admin = permiso Administrator
     return member.guild_permissions.administrator
 
 @bot.tree.command(name="maxme", description="(Admin) Te pone en el nivel máximo")
